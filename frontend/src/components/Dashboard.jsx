@@ -10,7 +10,7 @@ export default function Dashboard({ userName, onLogout, onVoteComplete }) {
   useEffect(() => {
     const fetchResolutions = async () => {
       try {
-        const response = await fetch('http://localhost:3000/resolutions');
+        const response = await fetch('${API_URL}/resolutions');
         const data = await response.json();
         setResolutions(data);
       } catch (err) {
@@ -22,7 +22,7 @@ export default function Dashboard({ userName, onLogout, onVoteComplete }) {
 
   const handleVote = async (resolutionId, decision) => {
     try {
-      const response = await fetch('http://localhost:3000/vote', {
+      const response = await fetch('${API_URL}/vote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resolutionId, decision }),

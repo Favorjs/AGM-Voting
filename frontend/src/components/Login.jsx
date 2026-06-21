@@ -1,12 +1,25 @@
 import { useState } from 'react';
-import { FaVoteYea, FaSignInAlt, FaEnvelope, FaPhone, FaHeadphones } from 'react-icons/fa';
+import { FaVoteYea, FaEnvelope, FaPhone, FaArrowRight, FaHeadphones } from 'react-icons/fa';
 import './Login.css';
+import { API_URL } from '../config';
 
 export default function LoginPage({ onLogin }) {
   const [identifier, setIdentifier] = useState('');
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [inputType, setInputType] = useState('email'); // 'email' or 'phone'
+  const [inputIcon, setInputIcon] = useState(<FaEnvelope />);
+
+  const handleInputChange = (e) => {
+    const value = e.target.value;
+    setIdentifier(value);
+    
+    // Auto-detect input type
+    if (/@/.test(value)) {
+      setInputIcon(<FaEnvelope />);
+    } else if (/^[\d+() -]+$/.test(value)) {
+      setInputIcon(<FaPhone />);
+    }
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -14,12 +27,18 @@ export default function LoginPage({ onLogin }) {
     setError('');
     
     try {
-      const response = await fetch('http://localhost:3000/api/login', {
+      const response = await fetch(`${API_URL}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identifier }),
         credentials: 'include'
       });
+      if (response.status === 409) {
+        const data = await response.json();
+        setError(data.error || 'User is already logged in elsewhere.');
+        setIsSubmitting(false);
+        return;
+      }
       const data = await response.json();
       if (data.success) {
         onLogin(data.message.replace('Welcome ', ''));
@@ -35,93 +54,61 @@ export default function LoginPage({ onLogin }) {
 
   return (
     <div className="login-container">
-      <header className="login-header">
-        <div className="header-content">
-          <div className="logo">
-            <FaVoteYea className="logo-icon" />
-            <span>E-Voting System</span>
+      <header className="login-nav">
+        <div className="nav-content">
+          <div className="brand">
+            <img src="/logo.png" alt="APEL Logo" className="brand-logo" />
           </div>
-          <nav className="main-nav">
-         
-            <a href="#" className="nav-link"><FaHeadphones />     Support</a>
-          </nav>
+          <a href="https://wa.me/2347046126698" className="help-link">
+            <FaHeadphones /> Support
+          </a>
         </div>
       </header>
-  
-      <main className="login-main wide-layout">
-        <div className="login-card">
-          <div className="card-header">
-            <div className="icon-circle">
-              <FaSignInAlt className="login-icon" />
-            </div>
-            {/* <h2>Access Your Voting Portal</h2> */}
-            <p className="subtext">Enter your credentials to participate in the election</p>
+
+      <main className="login-body">
+        <div className="login-content">
+          <div className="login-header">
+            <h1>Welcome</h1>
+            <p>Enter your details to access the AGM portal</p>
           </div>
 
-          <form onSubmit={handleSubmit} className="login-form">
-            <div className="input-container">
-              <div className="input-type-selector">
-                <button
-                  type="button"
-                  className={`type-btn ${inputType === 'email' ? 'active' : ''}`}
-                  onClick={() => setInputType('email')}
-                >
-                  <FaEnvelope /> Email
-                </button>
-                <button
-                  type="button"
-                  className={`type-btn ${inputType === 'phone' ? 'active' : ''}`}
-                  onClick={() => setInputType('phone')}
-                >
-                  <FaPhone /> Phone
-                </button>
-              </div>
-              
-              <div className="form-group">
-                <label htmlFor="identifier">
-                  {inputType === 'email' ? 'Email Address' : 'Phone Number'}
-                </label>
+          <form onSubmit={handleSubmit} className="modern-form">
+            <div className="input-group">
+              <label htmlFor="identifier">Email or Phone Number</label>
+              <div className="input-wrapper">
+                <span className="input-icon-left">{inputIcon}</span>
                 <input
                   id="identifier"
-                  type={inputType === 'email' ? 'email' : 'tel'}
+                  type="text"
                   value={identifier}
-                  onChange={(e) => setIdentifier(e.target.value)}
-                  placeholder={inputType === 'email' ? 'your.email@example.com' : '+234 (123) 456-7890'}
+                  onChange={handleInputChange}
+                  placeholder="name@example.com"
                   required
+                  className="modern-input"
                 />
               </div>
             </div>
 
             {error && (
-              <div className="error-message">
-                <p>{error}</p>
+              <div className="error-banner">
+                {error}
               </div>
             )}
 
-            <button type="submit" className="login-button" disabled={isSubmitting}>
-              {isSubmitting ? (
-                <span className="spinner"></span>
-              ) : (
+            <button type="submit" className="submit-btn" disabled={isSubmitting}>
+              {isSubmitting ? <span className="loader"></span> : (
                 <>
-                  <FaSignInAlt className="button-icon" />
-                  <span>Continue to Voting</span>
+                  Continue <FaArrowRight />
                 </>
               )}
             </button>
           </form>
+          
+          <div className="login-footer-note">
+            <p></p>
+          </div>
         </div>
       </main>
-
-      <footer className="login-footer">
-        <div className="footer-content">
-          <p>&copy; {new Date().getFullYear()} E-Voting System. All rights reserved. Apel Capital Registrars Limited</p>
-          {/* <div className="footer-links">
-            <a href="#">Privacy Policy</a>
-            <a href="#">Terms of Service</a>
-            <a href="#">Contact Us</a>
-          </div> */}
-        </div>
-      </footer>
     </div>
   );
 }

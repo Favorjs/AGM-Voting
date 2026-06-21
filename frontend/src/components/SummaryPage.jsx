@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
 import { Bar } from 'react-chartjs-2';
 import 'chart.js/auto';
+import { API_URL } from '../config';
 
-const socket = io('http://localhost:3000');
-
+const socket = io(API_URL);
 export default function SummaryPage() {
   const [results, setResults] = useState(null);
 

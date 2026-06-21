@@ -10,10 +10,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@zoom/meetingsdk": "^3.13.2",
+    "@zoomus/websdk": "^2.18.3",
+    "axios": "^1.11.0",
     "chart.js": "^4.4.9",
     "chartjs-plugin-datalabels": "^2.2.0",
     "html2canvas": "^1.4.1",
     "jspdf": "^3.0.1",
+    "lucide-react": "^0.536.0",
     "react": "^19.1.0",
     "react-chartjs-2": "^5.3.0",
     "react-dom": "^19.1.0",

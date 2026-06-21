@@ -3,58 +3,139 @@ const express = require('express');
 const session = require('express-session');
 const Sequelize = require('sequelize');
 const bodyParser = require('body-parser');
+
 const bcrypt = require('bcryptjs');
 const { Op,DataTypes } = require('sequelize');
 const cors = require('cors');
 const app = express();
+
+// BODY PARSER before any routes or session
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 const http = require('http');
 const { Server } = require('socket.io');
 const server = http.createServer(app);
 
-const MySQLStore = require('express-mysql-session')(session);
+const pgSession = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
 
 // Add this after your Sequelize initialization
 
 const requireAuth = (req, res, next) => {
-  console.log('Session debug:', req.session); // For debugging
+  //console.log('Session debug:', req.session); // For debugging
   if (!req.session?.userId) {
     return res.status(401).json({ 
       success: false,
       error: 'Not authenticated' 
-    });
+      
+});
+  }
+  next(); 
+};
+
+const requireAdminAuth = (req, res, next) => {
+  if (!req.session?.adminId) {
+    return res.status(401).json({ success: false, error: 'Admin not authenticated' });
   }
   next();
 };
+// Allowed origins for CORS
+// Explicit list of domains allowed to hit both REST and Socket.IO endpoints
+const allowedOrigins = [
+  'https://vote.apel.ng',     // production front-end
+  'http://localhost:5173',        // local Vite dev server
+  process.env.LOCAL_FRONTEND,
+  process.env.LIVE_FRONTEND1,
+  process.env.LIVE_FRONTEND2
+].filter(Boolean);
+// CORS configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+// Apply CORS to Express
+app.use(cors(corsOptions));
+
+// Configure Socket.IO with same CORS
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"]
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
 
-// Database setup
-
-const sequelize = new Sequelize(
-    process.env.DB_NAME || 'e-voting',
-    process.env.DB_USER || 'root',
-    process.env.DB_PASS || '',
-    {
+// Database setup (PostgreSQL)
+// PostgreSQL connection pool for session store
+// Build database configuration
+const pgConfig = process.env.DATABASE_URL
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false }
+    }
+  : {
+      user: process.env.DB_USER || 'postgres',
+      password: process.env.DB_PASSWORD || '',
       host: process.env.DB_HOST || 'localhost',
-      dialect: 'mysql',
+      port: process.env.DB_PORT || 5432,
+      database: process.env.DB_NAME || 'e-voting',
+      ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
+    };
+
+const pool = new Pool(pgConfig);
+
+const sequelize = process.env.DATABASE_URL
+  ? new Sequelize(process.env.DATABASE_URL, {
+      dialect: 'postgres',
+      protocol: 'postgres',
       logging: false,
+      dialectOptions: {
+        ssl: process.env.DB_SSL === 'false' ? false : {
+          require: true,
+          rejectUnauthorized: false
+        }
+      }
+    })
+  : new Sequelize(
+      process.env.DB_NAME || 'e-voting',
+      process.env.DB_USER || 'postgres',
+      process.env.DB_PASSWORD || '',
+      {
+        host: process.env.DB_HOST || 'localhost',
+        dialect: 'postgres',
+        dialectOptions: {
+          ssl: process.env.DB_SSL === 'true' ? {
+            require: true,
+            rejectUnauthorized: false
+          } : false
+        },
+        logging: false,
     }
   );
-  const sessionStore = new MySQLStore({
-    host: process.env.DB_HOST || 'localhost',
-    port: 3306,
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASS || '',
-    database: process.env.DB_NAME || 'e-voting',
-    clearExpired: true,
-    checkExpirationInterval: 900000, // 15 minutes
-    expiration: 86400000 // 24 hours
-  });
+  const sessionStore = new pgSession({
+  // Re-use the already configured pg connection pool so we don’t maintain
+  // two separate pools and we inherit the same credentials/SSL settings.
+  pool,
+  tableName: 'user_sessions',
+  createTableIfMissing: true,
+  pruneSessionInterval: 60 // seconds
+});
+
+// Trust the first proxy hop (Railway edge) so secure cookies are sent
+app.set('trust proxy', 1);
   
   app.use(session({
     key: 'session_cookie_name',
@@ -64,8 +145,8 @@ const sequelize = new Sequelize(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: false, // Set to true if using HTTPS
-      sameSite: 'lax',
+      secure: true, // Set to true if using HTTPS
+      sameSite: 'none',
       maxAge: 24 * 60 * 60 * 1000 // 24 hours
     }
   }));
@@ -85,13 +166,13 @@ const sequelize = new Sequelize(
 // }, {
 //   timestamps: false,
 //   freezeTableName: true
-// });
+//   
 
 const RegisteredUser = sequelize.define('registeredusers', {
   name: DataTypes.STRING,
   acno: DataTypes.STRING,
   holdings: {
-    type: DataTypes.INTEGER,
+    type: DataTypes.DECIMAL(15, 2),
     defaultValue: 0 // Add this
   },
   chn: { type:Sequelize.STRING, allowNull: true },
@@ -103,9 +184,43 @@ const RegisteredUser = sequelize.define('registeredusers', {
   },
   sessionId: DataTypes.STRING, 
   
+  
 });
 
   
+
+// Audit Committee Member Model
+const AuditCommittee = sequelize.define('AuditCommittee', {
+  id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true },
+  name: { type: Sequelize.STRING, allowNull: false },
+  bio: { type: Sequelize.TEXT },
+  isActive: { 
+    type: Sequelize.BOOLEAN, 
+    defaultValue: false 
+  },
+  votesFor: {
+    type: Sequelize.INTEGER,
+    defaultValue: 0
+  }
+});
+
+// Audit Vote Model
+const AuditVote = sequelize.define('AuditVote', {
+  id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true },
+  voterId: {
+    type: Sequelize.INTEGER,
+    allowNull: false,
+    references: {
+      model: 'registeredusers',
+      key: 'id'
+    }
+  }
+});
+
+
+
+// Sync models with database - force true will drop and recreate tables
+
 
 const Resolution = sequelize.define('Resolution', {
   id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true },
@@ -136,13 +251,41 @@ const Resolution = sequelize.define('Resolution', {
       fields: ['order']
     }
   ]
+  
 });
+
+
+
+
 
 
 
 io.on('connection', (socket) => {
   console.log('New client connected');
 
+
+  // Audit Committee Socket Events
+  socket.on('new-audit-vote', async ({ committeeId }) => {
+    try {
+      const committee = await AuditCommittee.findByPk(committeeId, {
+        attributes: ['id', 'votesFor']
+      });
+      
+      if (committee) {
+        io.emit('audit-vote-updated', {
+          committeeId: committee.id,
+          votesFor: committee.votesFor,
+          totalVotes: committee.votesFor
+        });
+      }
+    } catch (error) {
+      console.error('Error updating audit vote counts:', error);
+      socket.emit('audit-vote-error', { 
+        message: 'Failed to update audit vote counts',
+        committeeId
+      });
+    }
+  });
 
   socket.on('new-vote', async ({ resolutionId }) => {
     try {
@@ -153,7 +296,8 @@ io.on('connection', (socket) => {
           [sequelize.fn('SUM', sequelize.cast(sequelize.col('decision'), 'integer')), 'yes'],
         ],
         raw: true
-      });
+        
+});
   
       // Safely extract counts and ensure they are numbers
       const counts = voteCounts[0] || { total: 0, yes: 0 };
@@ -166,15 +310,18 @@ io.on('connection', (socket) => {
         yes,
         no,
         total // Make sure this is included
-      });
+        
+});
     } catch (error) {
       console.error('Error updating vote counts:', error);
       socket.emit('vote-error', { 
         message: 'Failed to update vote counts',
         resolutionId
-      });
+        
+});
     }
-  });
+    
+});
 
 
 
@@ -184,30 +331,92 @@ io.on('connection', (socket) => {
     if (resolution) {
       socket.emit('resolution-activated', resolution);
     }
-  });
+    
+});
   socket.emit('voting-state', votingState);
+  
 });
 
 const broadcastResolutionUpdate = async () => {
   const activeResolution = await Resolution.findOne({ 
     where: { isActive: true },
     include: [Vote]
-  });
+    
+});
   io.emit('resolution-update', activeResolution);
 };
 
-let votingState = false;
+let votingState = {
+  isOpen: false,
+  type: null,
+  activeId: null,
+  startedAt: null,
+  duration: 60
+};
 
-app.post('/api/admin/voting/open', (req, res) => {
-  setVotingState(true);
-  io.emit('voting-toggle', true);
+const getSettingNum = async (key, defaultVal) => {
+  try {
+    const s = await Setting.findByPk(key);
+    return s ? Number(s.value) : defaultVal;
+  } catch (e) { return defaultVal; }
+};
+
+const setVotingState = async (isOpen, type = null, activeId = null) => {
+  let duration = votingState.duration || 60;
+  let startedAt = null;
+  let sessionKey = votingState.sessionKey || 0;
+  if (isOpen) {
+    duration = await getSettingNum('votingDuration', 60);
+    if (!duration || duration < 10 || duration > 3600) duration = 60;
+    startedAt = Date.now();
+    sessionKey = sessionKey + 1; // unique key per voting session
+  }
+  votingState = { isOpen, type, activeId, startedAt, duration, sessionKey };
+  io.emit('voting-state', votingState);
+};
+
+// Add endpoint to get current voting state
+app.get('/api/voting-state', (req, res) => {
+  res.json(votingState);
+});
+
+app.post('/api/admin/voting/open', requireAdminAuth, async (req, res) => {
+  await setVotingState(true);
   res.json({ success: true });
 });
 
-app.post('/api/admin/voting/close', (req, res) => {
-  setVotingState(false);
-  io.emit('voting-toggle', false);
+// Get current voting state
+app.get('/api/admin/voting/state', (req, res) => {
+  res.json(votingState);
+});
+
+// Toggle voting state and broadcast to clients
+app.post('/api/admin/voting/toggle', requireAdminAuth, async (req, res) => {
+  const { type, activeId } = req.body;
+  if (!type || !activeId) {
+    return res.status(400).json({ error: 'type and activeId required' });
+  }
+  const newState = !votingState.isOpen;
+  await setVotingState(newState, type, activeId);
+  return res.json(votingState);
+});
+
+app.post('/api/admin/voting/close', requireAdminAuth, async (req, res) => {
+  await setVotingState(false);
   res.json({ success: true });
+});
+
+// Voting duration setting
+app.get('/api/admin/voting-duration', requireAdminAuth, async (req, res) => {
+  res.json({ duration: await getSettingNum('votingDuration', 60) });
+});
+
+app.put('/api/admin/voting-duration', requireAdminAuth, async (req, res) => {
+  const { duration } = req.body;
+  const val = Math.max(10, Math.min(3600, Number(duration) || 60));
+  await Setting.upsert({ key: 'votingDuration', value: String(val) });
+  votingState = { ...votingState, duration: val };
+  res.json({ duration: val });
 });
 
 
@@ -221,71 +430,153 @@ const Vote = sequelize.define('Vote', {
     type: DataTypes.INTEGER,
     defaultValue: 0 // Add this
   },
+  
 });
 
 
 
 
 // Define associations
-RegisteredUser.hasMany(Vote);
+RegisteredUser.hasMany(Vote, { foreignKey: 'registereduserId' });
 Resolution.hasMany(Vote);
-Vote.belongsTo(RegisteredUser);
-Vote.belongsTo(Resolution);
+Vote.belongsTo(RegisteredUser, { foreignKey: 'registereduserId' });
+Vote.belongsTo(Resolution, { foreignKey: 'ResolutionId' });
+
+AuditCommittee.hasMany(AuditVote, { onDelete: 'CASCADE' });
+AuditVote.belongsTo(AuditCommittee);
+RegisteredUser.hasMany(AuditVote);
+AuditVote.belongsTo(RegisteredUser);
+
+
+// Add these to your model associations
+AuditCommittee.hasMany(AuditVote, { foreignKey: 'AuditCommitteeId' });
+AuditVote.belongsTo(AuditCommittee, { foreignKey: 'AuditCommitteeId' });
+AuditVote.belongsTo(RegisteredUser, { foreignKey: 'voterId' });
+RegisteredUser.hasMany(AuditVote, { foreignKey: 'voterId' });
+// Global key-value settings (proxy votes, proxy holdings, etc.)
+const Setting = sequelize.define('Setting', {
+  key: { type: Sequelize.STRING, allowNull: false, unique: true, primaryKey: true },
+  value: { type: Sequelize.TEXT, allowNull: false }
+}, { timestamps: false });
+
+// Admin model
+const Admin = sequelize.define('Admin', {
+  id: { type: Sequelize.INTEGER, primaryKey: true, autoIncrement: true },
+  username: { type: Sequelize.STRING, allowNull: false, unique: true },
+  passwordHash: { type: Sequelize.STRING, allowNull: false },
+  isSuperAdmin: { type: Sequelize.BOOLEAN, defaultValue: false }
+});
 
 // Sync database
 sequelize.sync().then(() => {
   console.log('Database & tables created!');
+  
 });
 
 // Middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(session({
-  secret: 'your-secret-key',
-  resave: false,
-  saveUninitialized: true
-}));
+
 app.use(express.static('public'));
 
 
+// app.use((req, res, next) => {
+//   res.header('Access-Control-Allow-Origin', 'http://localhost:5173');
+//   res.header('Access-Control-Allow-Credentials', 'true');
+//   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+//   res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+//   if (req.method === 'OPTIONS') {
+//     return res.sendStatus(200);
+//   }
+//   next();
+// });
+
 app.use(cors({
-  origin: 'http://localhost:5173', // Vite default port
+  origin: ['https://vote.apel.ng','http://localhost:5173'], // Vite default port
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 // Routes
+
+// Admin ends AGM and thanks shareholders
+app.post('/api/admin/agm/end', requireAdminAuth, (req, res) => {
+  io.emit('agm-finished', {
+    message: 'Thank you for participating in the AGM. Voting has now closed.'
+  });
+  res.json({ success: true });
+});
+
 // Authentication routes
-app.post('/api/login', async (req, res) => {
+app.post('/api/login',   async (req, res) => {
   const { identifier } = req.body;
   
   try {
-    const user = await RegisteredUser.findOne({
-      where: {
-        [Sequelize.Op.or]: [
-          { email: identifier },
-          { phone_number: identifier }
-        ]
+    // Determine if identifier is an email or phone number
+    let user;
+    const emailRegex = /^[\w.-]+@[\w.-]+\.[A-Za-z]{2,}$/;
+
+    if (emailRegex.test(identifier)) {
+      const identifierLower = identifier.toLowerCase();
+      // Login by email
+            // Perform case-insensitive lookup by lowering both sides
+      user = await RegisteredUser.findOne({
+        where: Sequelize.where(
+          Sequelize.fn('lower', Sequelize.col('email')),
+          identifierLower
+        )
+      });
+    } else {
+      // Treat as phone number, build possible variants
+      const digitsOnly = String(identifier).replace(/\D/g, '');
+      let variants = [];
+
+      if (digitsOnly.startsWith('0')) {
+        // 0803…  -> [0803…, 234803…]
+        variants = [
+          digitsOnly,
+          '234' + digitsOnly.slice(1),
+          '+234' + digitsOnly.slice(1)
+        ];
+      } else if (digitsOnly.startsWith('234')) {
+        // 234803…  -> [234803…, 0803…]
+        variants = [
+          digitsOnly,
+          '+'+digitsOnly,
+          '0' + digitsOnly.slice(3)
+        ];
+      } else {
+        // e.g. 8031234567 -> try both local & intl
+        variants = [
+          digitsOnly,
+          '+'+digitsOnly,
+          '0' + digitsOnly,
+          '234' + digitsOnly,
+          '+234' + digitsOnly
+        ];
       }
-    });
+
+      user = await RegisteredUser.findOne({
+        where: {
+          phone_number: { [Sequelize.Op.in]: variants }
+        }
+      });
+    }
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-// Check if user already has an active session
-if (user.sessionId) {
-  // Option 1: Force logout previous session
-  await sessionStore.destroy(user.sessionId);
-  
-  //Option 2: Prevent new login
-  // return res.status(409).json({ 
-  //   error: 'User already logged in elsewhere' 
-  // });
-}
+    // Check if user already has an active session
+    // if (user.sessionId) {
+    //   // User already has an active session – refuse new login
+    //   return res.status(409).json({
+    //     error: 'User already logged in elsewhere'
+    //   });
+    // }
 
     // Create new session
-    req.session.regenerate(async(err) => {
+    req.session.regenerate(async (err) => {
       if (err) {
         console.error('Session regeneration error:', err);
         return res.status(500).json({ error: 'Login failed' });
@@ -294,10 +585,8 @@ if (user.sessionId) {
       req.session.userId = user.id;
       req.session.userName = user.name;
 
-    // Update user with current session ID
-   await user.update({ sessionId: req.sessionID });
-
-
+      // Update user with current session ID
+      await user.update({ sessionId: req.sessionID });
 
       req.session.save((err) => {
         if (err) {
@@ -312,54 +601,169 @@ if (user.sessionId) {
         });
       });
     });
-
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
+}); // Close /api/login route properly
+
+// ---------------------------------------------------
+// Endpoint: Register a new shareholder / voter
+// POST /api/admin/registered-users
+// Expects JSON body with at minimum { name, acno }
+// Optional: holdings, chn, email, phone_number
+// ---------------------------------------------------
+app.post('/api/admin/registered-users', requireAdminAuth, async (req, res) => {
+  try {
+    const { name, acno, holdings = 0, chn, email, phone_number } = req.body;
+
+    // Basic validation
+    if (!name || !acno) {
+      return res.status(400).json({ error: 'Name and account number (acno) are required' });
+    }
+
+    // Normalize email if provided
+    const normalizedEmail = email ? email.toLowerCase() : null;
+
+    // Prevent duplicates by account number or email
+    const existing = await RegisteredUser.findOne({
+      where: {
+        [Op.or]: [
+          { acno },
+          normalizedEmail ? { email: normalizedEmail } : null
+        ].filter(Boolean)
+      }
+    });
+
+    if (existing) {
+      return res.status(409).json({ error: 'A user with the same account number or email already exists' });
+    }
+
+    // Create the user
+    const newUser = await RegisteredUser.create({
+      name,
+      acno,
+      holdings,
+      chn,
+      email: normalizedEmail,
+      phone_number
+    });
+
+    return res.status(201).json({ success: true, data: newUser });
+  } catch (error) {
+    console.error('Error registering user:', error);
+    return res.status(500).json({ error: 'Failed to register user' });
+  }
 });
 
-
-
-// Get all resolutions with vote counts
-app.get('/api/resolutions', async (req, res) => {
+ // Get all resolutions with vote counts
+ app.get('/api/resolutions', async (req, res) => {
   try {
+    // First get all resolutions without vote counts
     const resolutions = await Resolution.findAll({
       attributes: ['id', 'title', 'description', 'order', 'isActive'],
-      include: [{
-        model: Vote,
-        attributes: [
-          [sequelize.fn('COUNT', sequelize.fn('IF', sequelize.col('decision'), 1, null)), 'yesVotes'],
-          [sequelize.fn('COUNT', sequelize.fn('IF', sequelize.literal('NOT decision'), 1, null)), 'noVotes']
-        ]
-      }],
-      group: ['Resolution.id'],
       order: [['order', 'ASC']]
     });
 
-    // Format the response
-    const formattedResolutions = resolutions.map(resolution => ({
-      id: resolution.id,
-      title: resolution.title,
-      description: resolution.description,
-      order: resolution.order,
-      isActive: resolution.isActive,
-      yesVotes: resolution.Votes[0]?.dataValues?.yesVotes || 0,
-      noVotes: resolution.Votes[0]?.dataValues?.noVotes || 0
-    }));
+    // Then get vote counts in a separate query
+    const voteCounts = await Vote.findAll({
+      attributes: [
+        'ResolutionId',
+        [sequelize.fn('COUNT', sequelize.col('id')), 'totalVotes'],
+        [sequelize.fn('SUM', sequelize.cast(sequelize.col('decision'), 'integer')), 'yesVotes']
+      ],
+      group: ['ResolutionId']
+    });
+
+    // Combine the data
+    const formattedResolutions = resolutions.map(resolution => {
+      const counts = voteCounts.find(v => v.get('ResolutionId') === resolution.id) || {
+        dataValues: { totalVotes: 0, yesVotes: 0 }
+      };
+      
+      return {
+        id: resolution.id,
+        title: resolution.title,
+        description: resolution.description,
+        order: resolution.order,
+        isActive: resolution.isActive,
+        yesVotes: counts.dataValues.yesVotes || 0,
+        noVotes: (counts.dataValues.totalVotes || 0) - (counts.dataValues.yesVotes || 0)
+      };
+    });
 
     res.json(formattedResolutions);
   } catch (error) {
     console.error('Error fetching resolutions:', error);
-    res.status(500).json({ error: 'Failed to fetch resolutions' });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch resolutions',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+// Get current voting state
+app.get('/api/admin/voting/state', (req, res) => {
+  res.json({ isOpen: votingState   
+});
+  
+});
+
+// Add this to your server.js file
+app.put('/api/admin/audit-committee/:id/activate', requireAdminAuth, async (req, res) => {
+  try {
+    // Start a transaction
+    const transaction = await sequelize.transaction();
+    
+    // Deactivate all other committee members
+    await AuditCommittee.update(
+      { isActive: false },
+      { where: { id: { [Op.ne]: req.params.id } }, transaction }
+    );
+    
+    // Activate the selected member
+    const member = await AuditCommittee.findByPk(req.params.id, { transaction });
+    if (!member) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'Audit committee member not found' });
+    }
+    
+    await member.update({ isActive: true }, { transaction });
+    
+    // Commit the transaction
+    await transaction.commit();
+    
+    await setVotingState(false, 'audit', member.id);
+    
+    // Broadcast updates
+    io.emit('audit-member-updated', member);
+    
+    res.json(member);
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error activating audit member:', error);
+    res.status(500).json({ error: 'Failed to activate audit committee member' });
   }
 });
 
-
-
-// Get current voting state
-app.get('/api/admin/voting/state', (req, res) => {
-  res.json({ isOpen: votingState });
+app.put('/api/admin/resolutions/:id/activate', requireAdminAuth, async (req, res) => {
+  try {
+    // Deactivate all other resolutions and audit members
+    await Resolution.update({ isActive: false }, { where: {} });
+    await AuditCommittee.update({ isActive: false }, { where: {} });
+    
+    // Activate the selected resolution
+    const resolution = await Resolution.findByPk(req.params.id);
+    await resolution.update({ isActive: true });
+    
+    await setVotingState(false, 'resolution', resolution.id);
+    
+    // Broadcast updates
+    io.emit('resolution-update', resolution);
+    res.json(resolution);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to activate resolution' });
+  }
 });
 
 // Voting route
@@ -374,47 +778,57 @@ app.get('/api/admin/voting/state', (req, res) => {
     
 //     await Vote.create({
 //       decision,
-//       RegisteredUserId: user.id,
+//       registereduserId: user.id,
 //       ResolutionId: resolutionId
-//     });
+//       
 
-//     await user.update({ hasVoted: true });
+
+//     await user.update({ hasVoted: true   
+
 //     res.send('Vote recorded successfully');
 //   } catch (error) {
 //     res.status(500).send('Error recording vote');
 //   }
-// });
+   
+
 
 // Add to server.js
-app.put('/api/admin/resolutions/:id/proxy', async (req, res) => {
+app.put('/api/admin/resolutions/:id/proxy', requireAdminAuth, async (req, res) => {
   try {
     const { proxyVotes } = req.body;
     
     if (typeof proxyVotes !== 'number' || proxyVotes < 0) {
-      return res.status(400).json({ error: 'Invalid proxy vote count' });
+      return res.status(400).json({ error: 'Invalid proxy vote count'   
+});
     }
 
     const resolution = await Resolution.findByPk(req.params.id);
     if (!resolution) {
-      return res.status(404).json({ error: 'Resolution not found' });
+      return res.status(404).json({ error: 'Resolution not found'   
+});
     }
 
-    await resolution.update({ proxyVotes });
+    await resolution.update({ proxyVotes   
+});
     
     // Broadcast updated resolution
     if (resolution.isActive) {
       const activeResolution = await Resolution.findOne({
         where: { isActive: true },
         include: [Vote]
-      });
+        
+});
       io.emit('resolution-update', activeResolution);
     }
 
-    res.json({ success: true, proxyVotes });
+    res.json({ success: true, proxyVotes   
+});
   } catch (error) {
     console.error('Proxy vote error:', error);
-    res.status(500).json({ error: 'Failed to update proxy votes' });
+    res.status(500).json({ error: 'Failed to update proxy votes'   
+});
   }
+  
 });
 
 app.get('/api/voting/resolutions', async (req, res) => {
@@ -422,29 +836,34 @@ app.get('/api/voting/resolutions', async (req, res) => {
     const resolutions = await Resolution.findAll({
       attributes: ['id', 'title', 'description', 'order'],
       order: [['order', 'ASC']]
-    });
+      
+});
     
     res.json(resolutions);
   } catch (error) {
     console.error('Voting API error:', error);
-    res.status(500).json({ error: 'Failed to fetch voting resolutions' });
+    res.status(500).json({ error: 'Failed to fetch voting resolutions'   
+});
   }
+  
 });
 
 // server.js - Updated resolution endpoint
-app.post('/api/admin/resolutions', async (req, res) => {
+app.post('/api/admin/resolutions', requireAdminAuth, async (req, res) => {
   // Add basic validation
   if (!req.body.title || !req.body.description) {
     return res.status(400).json({ 
       error: 'Title and description are required' 
-    });
+      
+});
   }
 
   try {
     const resolution = await Resolution.create({
       title: req.body.title,
       description: req.body.description
-    });
+      
+});
     
     // Return the created resolution with 201 status
     res.status(201).json(resolution);
@@ -454,40 +873,50 @@ app.post('/api/admin/resolutions', async (req, res) => {
       error: error.name,
       message: error.message,
       validationErrors: error.errors
-    });
+      
+});
     
     res.status(500).json({ 
       error: 'Database operation failed',
       details: error.message 
-    });
+      
+});
   }
+  
 });
 // PUT - Update resolution
-app.put('/api/resolutions/:id', async (req, res) => {
+app.put('/api/resolutions/:id', requireAdminAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const resolution = await Resolution.findByPk(id);
-    if (!resolution) return res.status(404).json({ error: 'Resolution not found' });
+    if (!resolution) return res.status(404).json({ error: 'Resolution not found'   
+});
 
     await resolution.update(req.body);
     res.json(resolution);
   } catch (error) {
-    res.status(500).json({ error: 'Error updating resolution' });
+    res.status(500).json({ error: 'Error updating resolution'   
+});
   }
+  
 });
 
 // DELETE - Remove resolution
-app.delete('/api/resolutions/:id', async (req, res) => {
+app.delete('/api/resolutions/:id', requireAdminAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const resolution = await Resolution.findByPk(id);
-    if (!resolution) return res.status(404).json({ error: 'Resolution not found' });
+    if (!resolution) return res.status(404).json({ error: 'Resolution not found'   
+});
 
     await resolution.destroy();
-    res.json({ message: 'Resolution deleted successfully' });
+    res.json({ message: 'Resolution deleted successfully'   
+});
   } catch (error) {
-    res.status(500).json({ error: 'Error deleting resolution' });
+    res.status(500).json({ error: 'Error deleting resolution'   
+});
   }
+  
 });
 // Results route
 // Updated /api/results endpoint
@@ -497,7 +926,8 @@ app.get('/api/results', async (req, res) => {
     const resolutions = await Resolution.findAll({
       attributes: ['id', 'title', 'description', 'isActive', 'createdAt'],
       order: [['createdAt', 'DESC']]
-    });
+      
+});
 
     // Then get vote counts in a separate query
     const voteCounts = await Vote.findAll({
@@ -507,7 +937,8 @@ app.get('/api/results', async (req, res) => {
         [sequelize.fn('SUM', sequelize.cast(sequelize.col('decision'), 'integer')), 'yesVotes']
       ],
       group: ['ResolutionId']
-    });
+      
+});
 
     // Combine the data
     const formattedResults = resolutions.map(res => {
@@ -532,21 +963,25 @@ app.get('/api/results', async (req, res) => {
         percentageNo: total > 0 ? Math.round((no / total) * 100) : 0,
         status: res.isActive ? 'Active' : yes > no ? 'Passed' : 'Rejected'
       };
-    });
+      
+});
 
     res.json({
       success: true,
       data: formattedResults,
       timestamp: new Date().toISOString()
-    });
+      
+});
   } catch (error) {
     console.error('Results error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to fetch results',
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+      
+});
   }
+  
 });
 
 // Get results for specific resolution
@@ -554,10 +989,12 @@ app.get('/api/results/:id', async (req, res) => {
   try {
     const resolution = await Resolution.findByPk(req.params.id, {
       attributes: ['id', 'title', 'description', 'createdAt']
-    });
+      
+});
 
     if (!resolution) {
-      return res.status(404).json({ error: 'Resolution not found' });
+      return res.status(404).json({ error: 'Resolution not found'   
+});
     }
 
     const votes = await Vote.findAll({
@@ -568,7 +1005,8 @@ app.get('/api/results/:id', async (req, res) => {
         required: false
       }],
       order: [['createdAt', 'DESC']]
-    });
+      
+});
 
     // Calculate votes and holdings
     const totalVotes = votes.length;
@@ -624,25 +1062,31 @@ app.get('/api/results/:id', async (req, res) => {
         },
         votes: voterDetails
       }
-    });
+      
+});
   } catch (error) {
     console.error('Results error:', error);
-    res.status(500).json({ error: 'Failed to fetch results' });
+    res.status(500).json({ error: 'Failed to fetch results'   
+});
   }
+  
 });
 
 // Frontend routes
-app.get('/', (req, res) => {
-  res.sendFile(__dirname + '/public/login.html');
-});
+// app.get('/', (req, res) => {
+//   res.sendFile(__dirname + '/public/login.html');
+  
+// });
 
 app.get('/dashboard', (req, res) => {
   if (!req.session.userId) return res.redirect('/');
   res.sendFile(__dirname + '/public/dashboard.html');
+  
 });
 
 app.get('/results-page', (req, res) => {
   res.sendFile(__dirname + '/public/results.html');
+  
 });
 
 // Get all resolutions
@@ -653,6 +1097,7 @@ app.get('/resolutions', async (req, res) => {
   } catch (error) {
     res.status(500).send('Error fetching resolutions');
   }
+  
 });
 
 
@@ -668,107 +1113,126 @@ app.get('/resolutions', async (req, res) => {
 //           [Sequelize.fn('COUNT', Sequelize.fn('IF', Sequelize.literal('NOT decision'), 1, null)), 'noVotes']
 //         ]
 //       }]
-//     });
+//       
+
     
-//     if (!resolution) return res.json({ active: false });
-    
+//     if (!resolution) return res.json({ active: false   
+// //     console.log(resolution);
 //     res.json({
 //       active: true,
 //       title: resolution.title,
 //       description: resolution.description,
 //       yes: resolution.Votes[0].dataValues.yesVotes,
 //       no: resolution.Votes[0].dataValues.noVotes
-//     });
+//       
+
 //   } catch (error) {
-//     res.status(500).json({ error: 'Failed to get active resolution' });
+//     res.status(500).json({ error: 'Failed to get active resolution'   
+// //     console.error(error);
 //   }
-// });
+//   
+
 
 // Admin-only endpoint
 // Add these endpoints
 
 // Activate a resolution
-app.put('/api/admin/resolutions/:id/activate', async (req, res) => {
-  try {
-    // Deactivate all other resolutions first
-    await Resolution.update({ isActive: false }, { where: {} });
-    
-    // Activate the selected resolution
-    const resolution = await Resolution.findByPk(req.params.id);
-    await resolution.update({ isActive: true });
-    
-    // Broadcast the update
-    await broadcastResolutionUpdate();
-    
-    res.json(resolution);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to activate resolution' });
-  }
-});
-
+// In server.js, update the resolution activation
 
 // app.post('/api/admin/voting/open', async (req, res) => {
 //   votingState = true;
 //   io.emit('voting-state', true);
-//   res.json({ success: true });
+//   res.json({ success: true   
+// //   console.log('Voting opened');
 // });
 
 // app.post('/api/admin/voting/close', async (req, res) => {
 //   votingState = false;
 //   io.emit('voting-state', false);
-//   res.json({ success: true });
-// });
+//   res.json({ success: true   
+// //   console.log('Voting closed');
+//   
+
 // Close current resolution
 
 // Close Resolution
-app.post('/api/admin/resolutions/close', async (req, res) => {
+app.post('/api/admin/resolutions/close', requireAdminAuth, async (req, res) => {
   try {
-    await Resolution.update({ isActive: false }, { where: { isActive: true } });
-    votingState = false; // Also close voting when resolution closes
-    
+    await Resolution.update({ isActive: false }, { where: { isActive: true }   
+});
+    await setVotingState(false); // properly close voting
+
     // Broadcast updates
     io.emit('resolution-closed');
-    io.emit('voting-state', false);
     
-    res.json({ success: true });
+    res.json({ success: true   
+});
   } catch (error) {
-    res.status(500).json({ error: 'Failed to close resolution' });
+    res.status(500).json({ error: 'Failed to close resolution'   
+});
   }
+  
 });
 
-//Toggle Voting State
-app.post('/api/admin/voting/toggle', async (req, res) => {
-  try {
-    // Check if there's an active resolution first
-    const activeResolution = await Resolution.findOne({ where: { isActive: true } });
-    if (!activeResolution) {
-      return res.status(400).json({ error: 'No active resolution to vote on' });
-    }
 
-    votingState = !votingState;
-    io.emit('voting-state', votingState);
-    res.json({ success: true, isOpen: votingState });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to toggle voting' });
-  }
-});
-
-// Get active resolution
-app.get('/api/active-resolution', async (req, res) => {
+// Change from /api/audit-committee/active to /api/admin/audit-committee/active
+app.get('/api/admin/audit-committee/active', async (req, res) => {
   try {
-    const resolution = await Resolution.findOne({
+    const member = await AuditCommittee.findOne({ 
       where: { isActive: true },
-      include: [Vote] // if you're including votes
+      include: [{
+        model: AuditVote,
+        attributes: ['id'],
+        include: [{
+          model: RegisteredUser,
+          attributes: ['id', 'name', 'holdings']
+        }]
+      }]
     });
     
-    if (!resolution) return res.status(404).json({ message: 'No active resolution' });
-
-    res.json(resolution);
-  } catch (err) {
-    console.error('Error fetching active resolution:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!member) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'No active audit committee member',
+        data: null
+      });
+    }
+    
+    const votesFor = await AuditVote.count({
+      where: { AuditCommitteeId: member.id }
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        ...member.toJSON(),
+        votesFor
+      }
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error',
+      data: null
+    });
   }
 });
+
+// Add this endpoint for /api/active-resolution
+app.get('/api/active-resolution', async (req, res) => {
+  try {
+    const resolution = await Resolution.findOne({ where: { isActive: true } });
+    if (!resolution) return res.status(404).json({ success: false, error: 'No active resolution' });
+    res.json({ success: true, data: resolution });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to fetch active resolution' });
+  }
+});
+
+// (duplicate toggle route removed — handled above at /api/admin/voting/toggle)
+
+// Get active resolution
 
 // Update results endpoint
 
@@ -777,30 +1241,37 @@ app.get('/api/check-vote', requireAuth, async (req, res) => {
   try {
     const activeResolution = await Resolution.findOne({ 
       where: { isActive: true } 
-    });
+      
+});
     
     if (!activeResolution) {
-      return res.json({ hasVoted: false });
+      return res.json({ hasVoted: false   
+});
     }
 
     const vote = await Vote.findOne({
       where: {
-        RegisteredUserId: req.session.userId,
+        registereduserId: req.session.userId,
         ResolutionId: activeResolution.id
       }
-    });
+      
+});
 
     res.json({ 
       hasVoted: !!vote,
       userId: req.session.userId // For debugging
-    });
+      
+});
   } catch (error) {
     console.error('Check vote error:', error);
-    res.status(500).json({ error: 'Failed to check vote status' });
+    res.status(500).json({ error: 'Failed to check vote status'   
+});
   }
+  
 });
 
 // Update vote endpoint
+
 app.post('/api/vote', requireAuth, async (req, res) => {
   try {
     const { resolutionId, decision } = req.body;
@@ -833,7 +1304,7 @@ app.post('/api/vote', requireAuth, async (req, res) => {
     // Check if already voted
     const existingVote = await Vote.findOne({
       where: {
-        RegisteredUserId: userId,
+        registereduserId: userId,
         ResolutionId: resolutionId
       }
     });
@@ -845,25 +1316,18 @@ app.post('/api/vote', requireAuth, async (req, res) => {
     // Record vote with holdings
     const vote = await Vote.create({
       decision,
-      RegisteredUserId: userId,
+      registereduserId: userId,
       ResolutionId: resolutionId,
       holdings: Number(user.holdings) || 0 // Ensure it's a number
     });
 
-    // Log the vote creation for debugging
-    // console.log('Created vote with holdings:', {
-    //   voteId: vote.id,
-    //   userId: vote.RegisteredUserId,
-    //   resolutionId: vote.ResolutionId,
-    //   holdings: vote.holdings
-    // });
     // Calculate vote counts with holdings
     const voteCounts = await Vote.findAll({
       where: { ResolutionId: resolutionId },
       attributes: [
         [sequelize.fn('COUNT', sequelize.col('id')), 'total'],
         [sequelize.fn('SUM', sequelize.cast(sequelize.col('decision'), 'integer')), 'yes'],
-        [sequelize.fn('SUM', sequelize.literal('NOT decision')), 'no'],
+        [sequelize.literal('SUM(CASE WHEN NOT decision THEN 1 ELSE 0 END)'), 'no'],
         [sequelize.fn('SUM', sequelize.col('holdings')), 'totalHoldings'],
         [sequelize.fn('SUM', sequelize.literal('CASE WHEN decision THEN holdings ELSE 0 END')), 'yesHoldings'],
         [sequelize.fn('SUM', sequelize.literal('CASE WHEN NOT decision THEN holdings ELSE 0 END')), 'noHoldings']
@@ -901,6 +1365,8 @@ app.post('/api/vote', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Failed to record vote' });
   }
 });
+
+
 // Submit a vote
 // Handle votes
 
@@ -917,8 +1383,11 @@ app.post('/api/logout', async (req, res) => {
   }
   
   req.session.destroy(() => {
-    res.json({ success: true });
-  });
+    res.json({ success: true   
+});
+    
+});
+  
 });
 
 // Add middleware to check for concurrent sessions
@@ -931,7 +1400,8 @@ const checkConcurrentSession = async (req, res, next) => {
       req.session.destroy();
       return res.status(401).json({ 
         error: 'Logged in elsewhere' 
-      });
+        
+});
     }
     next();
   } catch (error) {
@@ -940,7 +1410,525 @@ const checkConcurrentSession = async (req, res, next) => {
 };
 
 app.use('/api', checkConcurrentSession);
+
+// Audit Committee API Endpoints
+
+// Get all audit committee members
+// In server.js, add these endpoints if not already present:
+
+// Get all audit committee members
+app.get('/api/audit-committee', async (req, res) => {
+  try {
+    const members = await AuditCommittee.findAll({
+      order: [['createdAt', 'ASC']]
+    });
+    res.json(members);
+  } catch (error) {
+    console.error('Error fetching audit committee:', error);
+    res.status(500).json({ error: 'Failed to fetch audit committee' });
+  }
+});
+
+// Create new audit committee member
+app.post('/api/audit-committee', requireAdminAuth, async (req, res) => {
+  try {
+    const { name, bio } = req.body;
+    const member = await AuditCommittee.create({ name, bio });
+    res.status(201).json(member);
+  } catch (error) {
+    console.error('Error creating audit committee member:', error);
+    res.status(500).json({ error: 'Failed to create audit committee member' });
+  }
+});
+
+// Update audit committee member
+// Update audit committee member
+app.put('/api/audit-committee/:id', requireAdminAuth, async (req, res) => {
+  const transaction = await sequelize.transaction();
+  
+  try {
+    const { name, bio, isActive } = req.body;
+    const member = await AuditCommittee.findByPk(req.params.id, { transaction });
+    
+    if (!member) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'Audit committee member not found' });
+    }
+    
+    // If activating this member, deactivate all others
+    if (isActive && !member.isActive) {
+      await AuditCommittee.update(
+        { isActive: false },
+        { where: { id: { [Op.ne]: member.id } }, transaction }
+      );
+    }
+    
+    // Update the member
+    const updatedMember = await member.update(
+      { name, bio, isActive },
+      { transaction }
+    );
+    
+    await transaction.commit();
+    
+    // Broadcast the update
+    io.emit('audit-member-updated', updatedMember);
+    res.json(updatedMember);
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error updating audit committee member:', error);
+    res.status(500).json({ error: 'Failed to update audit committee member' });
+  }
+});
+
+// Delete audit committee member
+app.delete('/api/audit-committee/:id', requireAdminAuth, async (req, res) => {
+  const transaction = await sequelize.transaction();
+  
+  try {
+    const member = await AuditCommittee.findByPk(req.params.id, { transaction });
+    
+    if (!member) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'Audit committee member not found' });
+    }
+    
+    // Delete associated votes first if needed
+    await AuditVote.destroy({
+      where: { AuditCommitteeId: member.id },
+      transaction
+    });
+    
+    await member.destroy({ transaction });
+    await transaction.commit();
+    
+    // Broadcast the deletion
+    io.emit('audit-member-deleted', { id: member.id });
+    res.status(204).send();
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error deleting audit committee member:', error);
+    res.status(500).json({ error: 'Failed to delete audit committee member' });
+  }
+});
+
+// Get active audit committee member
+app.get('/api/admin/audit-committee/active', async (req, res) => {
+  try {
+    const member = await AuditCommittee.findOne({ 
+      where: { isActive: true },
+      include: [{
+        model: AuditVote,
+        attributes: ['id'],
+        include: [{
+          model: RegisteredUser,
+          attributes: ['id', 'name', 'holdings']
+        }]
+      }]
+    });
+    
+    if (!member) {
+      return res.status(404).json({ error: 'No active audit committee member' });
+    }
+    
+    // Calculate total votes
+    const votesFor = await AuditVote.count({
+      where: { AuditCommitteeId: member.id }
+    });
+    
+    const response = member.toJSON();
+    response.votesFor = votesFor;
+    
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching active audit member:', error);
+    res.status(500).json({ error: 'Failed to fetch active audit member' });
+  }
+});
+
+// Get active audit committee member
+app.get('/api/audit-committee/active', async (req, res) => {
+  try {
+    const member = await AuditCommittee.findOne({ where: { isActive: true } });
+    if (!member) return res.json(null);
+    return res.json(member);
+  } catch (err) {
+    console.error('Error fetching active audit committee member', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get active resolution
+app.get('/api/active-resolution', async (req, res) => {
+  try {
+    const resolution = await Resolution.findOne({ where: { isActive: true } });
+    if (!resolution) return res.json(null);
+    return res.json(resolution);
+  } catch (err) {
+    console.error('Error fetching active resolution', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Submit audit vote (max 3 per user)
+app.post('/api/audit-vote', requireAuth, async (req, res) => {
+  const transaction = await sequelize.transaction();
+  
+  try {
+    const { committeeId } = req.body;
+    if (!committeeId) {
+      return res.status(400).json({ error: 'committeeId is required' });
+    }
+    const userId = req.session.userId;
+
+    // Count total audit votes cast by this user so far
+    const voteCount = await AuditVote.count({ where: { voterId: userId } });
+
+    if (voteCount >= 3) {
+      await transaction.rollback();
+      return res.status(400).json({ error: 'You have voted 3 times, voting power exhausted' });
+    }
+
+    // Check if user has already voted for this active member
+    const existingVote = await AuditVote.findOne({
+      where: { 
+        voterId: userId,
+        '$AuditCommittee.isActive$': true
+      },
+      include: [{
+        model: AuditCommittee,
+        attributes: []
+      }],
+      transaction
+    });
+
+    if (existingVote) {
+      await transaction.rollback();
+      return res.status(400).json({ error: 'You have already voted for this member' });
+    }
+
+    // Create vote
+    await AuditVote.create({
+      voterId: userId,
+      AuditCommitteeId: committeeId
+    }, { transaction });
+
+    // Update vote count
+    await AuditCommittee.increment({ votesFor: 1 }, {
+      where: { id: committeeId },
+      transaction
+    });
+
+    await transaction.commit();
+    
+    // Broadcast update
+    const committee = await AuditCommittee.findByPk(committeeId);
+    io.emit('audit-vote-updated', {
+      committeeId: committee.id,
+      votesFor: committee.votesFor,
+      totalVotes: committee.votesFor
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    await transaction.rollback();
+    console.error('Error submitting audit vote:', error);
+    res.status(500).json({ error: 'Failed to submit vote' });
+  }
+});
+
+// Get active audit committee member
+
+
+
+
+// Public endpoint to get currently active resolution
+app.get('/api/active-resolution', async (req, res) => {
+  try {
+    const active = await Resolution.findOne({ where: { isActive: true } });
+    if (!active) {
+      return res.status(404).json({ error: 'No active resolution' });
+    }
+
+    // Aggregate vote counts (yes / no)
+    const counts = await Vote.findAll({
+      where: { ResolutionId: active.id },
+      attributes: [
+        [sequelize.fn('COUNT', sequelize.col('id')), 'total'],
+        [sequelize.fn('SUM', sequelize.cast(sequelize.col('decision'), 'integer')), 'yes']
+      ],
+      raw: true
+    });
+
+    const total = parseInt(counts[0]?.total || 0);
+    const yes = parseInt(counts[0]?.yes || 0);
+    const no = total - yes;
+
+    res.json({ success: true, data: { ...active.toJSON(), voteCounts: { yes, no, total } } });
+  } catch (err) {
+    console.error('Error fetching active resolution:', err);
+    res.status(500).json({ error: 'Failed to fetch active resolution' });
+  }
+});
+
+// Public endpoint to get currently active audit committee member (alias for admin route)
+app.get('/api/audit-committee/active', async (req, res) => {
+  try {
+    const member = await AuditCommittee.findOne({ where: { isActive: true } });
+    if (!member) return res.status(404).json({ error: 'No active audit committee member' });
+
+    const votesFor = await AuditVote.count({ where: { AuditCommitteeId: member.id } });
+    res.json({ success: true, data: { ...member.toJSON(), votesFor } });
+  } catch (err) {
+    console.error('Error fetching active audit member:', err);
+    res.status(500).json({ error: 'Failed to fetch active audit member' });
+  }
+});
+
+// Check if logged-in user has voted on the active resolution
+app.get('/api/check-vote', requireAuth, async (req, res) => {
+  try {
+    const active = await Resolution.findOne({ where: { isActive: true } });
+    if (!active) return res.json({ hasVoted: false });
+
+    const vote = await Vote.findOne({
+      where: { registereduserId: req.session.userId, ResolutionId: active.id }
+    });
+    res.json({ hasVoted: !!vote });
+  } catch (err) {
+    console.error('Error checking vote status:', err);
+    res.status(500).json({ error: 'Failed to check vote status' });
+  }
+});
+
+// Check audit vote status and remaining power
+app.get('/api/check-audit-vote', requireAuth, async (req, res) => {
+  try {
+    const active = await AuditCommittee.findOne({ where: { isActive: true } });
+    if (!active) return res.json({ hasVoted: false });
+
+    // total votes across all audit committee members
+    const totalVotes = await AuditVote.count({ where: { voterId: req.session.userId } });
+
+    const vote = await AuditVote.findOne({
+      where: { voterId: req.session.userId, AuditCommitteeId: active.id }
+    });
+    res.json({ 
+      hasVoted: !!vote,
+      totalVotes,
+      exhausted: totalVotes >= 3
+    });
+  } catch (err) {
+    console.error('Error checking audit vote status:', err);
+    res.status(500).json({ error: 'Failed to check audit vote status' });
+  }
+});
+
+// ── Admin Auth ──────────────────────────────────────────────────────────────
+
+// POST /api/super-admin — create an admin account
+app.post('/api/super-admin', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password required' });
+  }
+  try {
+    const passwordHash = await bcrypt.hash(password, 12);
+    const admin = await Admin.create({ username, passwordHash, isSuperAdmin: true });
+    res.status(201).json({ success: true, id: admin.id, username: admin.username });
+  } catch (err) {
+    if (err.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({ error: 'Username already exists' });
+    }
+    console.error('Super admin creation error:', err);
+    res.status(500).json({ error: 'Failed to create super admin' });
+  }
+});
+
+// POST /api/admin/auth/login
+app.post('/api/admin/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  try {
+    const admin = await Admin.findOne({ where: { username } });
+    if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+    const match = await bcrypt.compare(password, admin.passwordHash);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+    req.session.adminId = admin.id;
+    req.session.adminUsername = admin.username;
+    req.session.save((err) => {
+      if (err) return res.status(500).json({ error: 'Login failed' });
+      res.json({ success: true, username: admin.username });
+    });
+  } catch (err) {
+    console.error('Admin login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// POST /api/admin/auth/logout
+app.post('/api/admin/auth/logout', (req, res) => {
+  req.session.destroy(() => res.json({ success: true }));
+});
+
+// GET /api/admin/auth/me
+app.get('/api/admin/auth/me', (req, res) => {
+  if (!req.session?.adminId) return res.status(401).json({ authenticated: false });
+  res.json({ authenticated: true, username: req.session.adminUsername });
+});
+
+// Deactivate all audit committee members
+app.post('/api/admin/audit-committee/deactivate-all', requireAdminAuth, async (req, res) => {
+  try {
+    await AuditCommittee.update({ isActive: false }, { where: {} });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to deactivate all' });
+  }
+});
+
+// Deactivate a single audit committee member
+app.put('/api/admin/audit-committee/:id/deactivate', requireAdminAuth, async (req, res) => {
+  try {
+    const member = await AuditCommittee.findByPk(req.params.id);
+    if (!member) return res.status(404).json({ error: 'Member not found' });
+    await member.update({ isActive: false });
+    io.emit('audit-member-updated', member);
+    res.json(member);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to deactivate member' });
+  }
+});
+
+// ── Voters / Registered Users ────────────────────────────────────────────────
+
+app.get('/api/admin/voters', requireAdminAuth, async (req, res) => {
+  try {
+    const voters = await RegisteredUser.findAll({
+      attributes: {
+        include: [
+          [
+            sequelize.literal(`(SELECT COUNT(*) FROM "Votes" WHERE "Votes"."registereduserId" = "registeredusers"."id")`),
+            'resolutionVoteCount'
+          ],
+          [
+            sequelize.literal(`(SELECT COUNT(*) FROM "AuditVotes" WHERE "AuditVotes"."voterId" = "registeredusers"."id")`),
+            'auditVoteCount'
+          ]
+        ]
+      },
+      order: [[sequelize.literal('"holdings"'), 'DESC NULLS LAST']]
+    });
+    res.json(voters);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch voters' });
+  }
+});
+
+app.delete('/api/admin/voters/:id', requireAdminAuth, async (req, res) => {
+  try {
+    const voter = await RegisteredUser.findByPk(req.params.id);
+    if (!voter) return res.status(404).json({ error: 'Voter not found' });
+    await Vote.destroy({ where: { registereduserId: voter.id } });
+    await AuditVote.destroy({ where: { voterId: voter.id } });
+    await voter.destroy();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete voter' });
+  }
+});
+
+app.get('/api/admin/stats', requireAdminAuth, async (req, res) => {
+  try {
+    const [totalVoters, resolutionVotes, auditVotes] = await Promise.all([
+      RegisteredUser.count(),
+      Vote.count(),
+      AuditVote.count()
+    ]);
+    res.json({ totalVoters, resolutionVotes, auditVotes });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// ── Clear Votes ──────────────────────────────────────────────────────────────
+
+app.delete('/api/admin/votes/resolutions', requireAdminAuth, async (req, res) => {
+  try {
+    await Vote.destroy({ where: {} });
+    io.emit('votes-cleared', { type: 'resolutions' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Clear resolution votes error:', err);
+    res.status(500).json({ error: 'Failed to clear resolution votes' });
+  }
+});
+
+app.delete('/api/admin/votes/audit', requireAdminAuth, async (req, res) => {
+  try {
+    await AuditVote.destroy({ where: {} });
+    await AuditCommittee.update({ votesFor: 0 }, { where: {} });
+    io.emit('votes-cleared', { type: 'audit' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Clear audit votes error:', err);
+    res.status(500).json({ error: 'Failed to clear audit votes' });
+  }
+});
+
+app.delete('/api/admin/votes/all', requireAdminAuth, async (req, res) => {
+  try {
+    await Vote.destroy({ where: {} });
+    await AuditVote.destroy({ where: {} });
+    await AuditCommittee.update({ votesFor: 0 }, { where: {} });
+    io.emit('votes-cleared', { type: 'all' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Clear all votes error:', err);
+    res.status(500).json({ error: 'Failed to clear all votes' });
+  }
+});
+
+// ── Proxy Settings ───────────────────────────────────────────────────────────
+
+// GET /api/proxy-settings — public, used by results page
+app.get('/api/proxy-settings', async (req, res) => {
+  try {
+    const rows = await Setting.findAll({ where: { key: ['proxyVotes', 'proxyHoldings'] } });
+    const map = Object.fromEntries(rows.map(r => [r.key, Number(r.value)]));
+    res.json({
+      proxyVotes: map.proxyVotes ?? 0,
+      proxyHoldings: map.proxyHoldings ?? 0
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch proxy settings' });
+  }
+});
+
+// PUT /api/admin/proxy-settings — admin only
+app.put('/api/admin/proxy-settings', requireAdminAuth, async (req, res) => {
+  const { proxyVotes, proxyHoldings } = req.body;
+  if (typeof proxyVotes !== 'number' || typeof proxyHoldings !== 'number') {
+    return res.status(400).json({ error: 'proxyVotes and proxyHoldings must be numbers' });
+  }
+  try {
+    await Setting.upsert({ key: 'proxyVotes', value: String(proxyVotes) });
+    await Setting.upsert({ key: 'proxyHoldings', value: String(proxyHoldings) });
+    io.emit('proxy-settings-updated', { proxyVotes, proxyHoldings });
+    res.json({ success: true, proxyVotes, proxyHoldings });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to save proxy settings' });
+  }
+});
+
+// ── End Admin Auth ───────────────────────────────────────────────────────────
+
+// Start the server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  
 });

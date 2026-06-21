@@ -1,16 +1,37 @@
-// App.jsx
-import { useState } from 'react';
-import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Login from './components/Login';
 import LandingPage from './components/LandingPage';
 import VotingPage from './components/VotingPage';
 import Results from './components/Results';
-import ResolutionManager from './components/ResolutionManager';
 import AdminPanel from './components/AdminPanel';
-import SummaryPage from './components/summaryPage';
+import AdminLogin from './components/AdminLogin';
 import ResultsPage from './components/ResultsPage';
-import ResolutionModal from './components/ResolutionModal';
+import { API_URL } from './config';
 
+function AdminRoute() {
+  const [adminUser, setAdminUser] = useState(null);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    fetch(`${API_URL}/api/admin/auth/me`, { credentials: 'include' })
+      .then(r => r.json())
+      .then(data => { if (data.authenticated) setAdminUser(data.username); })
+      .catch(() => {})
+      .finally(() => setChecking(false));
+  }, []);
+
+  if (checking) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', fontFamily: 'Montserrat,sans-serif', color: '#64748b' }}>
+        Loading…
+      </div>
+    );
+  }
+
+  if (!adminUser) return <AdminLogin onLogin={setAdminUser} />;
+  return <AdminPanel adminUser={adminUser} onAdminLogout={() => setAdminUser(null)} />;
+}
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -34,24 +55,10 @@ export default function App() {
   return (
     <Router>
       <div className="app">
-        {/* <nav className="admin-nav">
-          {user && (
-            <Link to="/manage" className="admin-link">
-              Manage Resolutions
-            </Link>
-          )}
-        </nav> */}
-
         <Routes>
-          <Route path="/manage" element={
-            <ResolutionManager />
-          } />
-          
-        <Route path="/summary" element={<SummaryPage />} />
-        <Route path="/adminControl" element={<AdminPanel />} />
-        <Route path="/results" element={<ResultsPage />} />
-        {/* <Route path="/control" element={<ResolutionModal/>} /> */}
-          
+          <Route path="/admin" element={<AdminRoute />} />
+          <Route path="/admin/:tab?" element={<AdminRoute />} />
+          <Route path="/results" element={<ResultsPage />} />
           <Route path="/" element={
             currentPage === 'login' ? <Login onLogin={handleLogin} /> :
             currentPage === 'landing' ? <LandingPage userName={user} onLogout={handleLogout} onStartVoting={() => setCurrentPage('voting')} /> :
