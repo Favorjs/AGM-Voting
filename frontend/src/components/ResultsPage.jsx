@@ -197,9 +197,7 @@ export default function ResultsPage() {
       });
     }, 1000);
     return () => clearInterval(interval);
-  // sessionKey is a server counter that increments on every open — guarantees a fresh timer
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isVotingOpen, votingSessionKey]);
+  }, [isVotingOpen, votingSessionKey, votingDuration]);
 
   const downloadPDF = async () => {
     try {
@@ -457,7 +455,7 @@ const fetchActiveAuditMember = async () => {
         <div className="current-resolution">
           <h2>Audit Committee Election</h2>
           {/* <h1><span style={{fontSize:'0.8em',marginLeft:'10px'}}>
-            {isVotingOpen ? (timeLeft>0?`(${formatTime(timeLeft)})`:'(Time\'s up)') : ''}
+            {isVotingOpen && timeLeft > 0 ? `(${formatTime(timeLeft)})` : ''}
           </span></h1> */}
           
           <div className="results-display">
@@ -517,7 +515,7 @@ const fetchActiveAuditMember = async () => {
         <div className="current-resolution">
         
           <h1><span style={{fontSize:'0.8em',marginLeft:'10px'}}>
-            {isVotingOpen ? (timeLeft>0?`(${formatTime(timeLeft)})`:'(Time\'s up)') : ''}
+            {isVotingOpen && timeLeft > 0 ? `(${formatTime(timeLeft)})` : ''}
           </span></h1>
           <h2>{activeResolution.title}</h2>
           <p>{activeResolution.description}</p>
